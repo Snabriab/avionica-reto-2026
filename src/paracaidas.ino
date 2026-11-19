@@ -78,3 +78,5 @@ void loop() {
 
   lastReading = reading;
 }
+
+// Simulacion de hardware en Wokwi: https://wokwi.com/projects/481081023571677185
