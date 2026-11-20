@@ -6,6 +6,7 @@
 // - LED Rojo (Estado 3): GPIO 21
 // - LED Azul (Ignicion): GPIO 22
 
+
 const int PIN_BTN     = 4;
 const int PIN_LED_1   = 18;
 const int PIN_LED_2   = 19;
@@ -19,6 +20,8 @@ const unsigned long LONG_PRESS_MIN  = 2000;
 //tiempos de cambio de estado de la misionn
 const unsigned long IGNITION_PULSE_MS = 1000;
 const unsigned long BEACON_BLINK_MS = 500;
+//8 SEGUNDOS DESPUES DEL DESPEGUE PEROOO SOLO SIN DETECCION DEL CLIC APOGEO
+const unsigned long BACKUP_DEPLOY_MS = 8000;
 
 //estados deee la mision
 enum EstadoMision {
@@ -34,6 +37,10 @@ EstadoMision estadoActual = DESARMADO;
 //temporizadores para el estado
 unsigned long ignitionStartTime = 0;
 unsigned long lastBlinkTime = 0;
+// CONTROL PARA UNA UNICA IGNICION
+unsigned long ascentStartTime = 0;
+bool ignitionDone = false;
+
 bool redLedState = LOW;
 
 int lastReading = HIGH;
@@ -64,15 +71,18 @@ void cambiarEstado(EstadoMision nuevoEstado) {
     digitalWrite(PIN_LED_1, HIGH);
     Serial.println("ARMADO (Listo en rampa - LED Verde)");
     break;
+    //contador de 8 segundos 
     case EN_VUELO:
     digitalWrite(PIN_LED_2, HIGH);
-    Serial.println("EN_VUELO (Ascenso activo - LED Amarillo)");
+    ascentStartTime = millis();
+    Serial.println("EN_VUELO (Ascenso activo - Temporizador respaldo 8s iniciado)");
     break;
     case APOGEO_IGNICION:
     digitalWrite(PIN_LED_3, HIGH);
     digitalWrite(PIN_LED_IGN, HIGH);
     ignitionStartTime = millis();
-    Serial.println("APOGEO_IGNICION (Disparo de paracaidas 1000ms - LED Rojo + Azul)");
+    ignitionDone = false;
+    Serial.println("APOGEO_IGNICION (Disparo unico de paracaidas 1000ms - Esperando aterrizaje)");
     break;
     case ATERRIZADO:
     redLedState = HIGH;
@@ -92,8 +102,11 @@ void procesarPulsacionCorta() {
     case EN_VUELO:
      cambiarEstado(APOGEO_IGNICION);
      break;
+    case APOGEO_IGNICION:
+     cambiarEstado(ATERRIZADO);
+     break;
     default:
-     Serial.println("  -> Pulsacion corta ignorada en este estado.");
+     Serial.println("  -> [IGNORADO] Pulsacion corta no valida en este estado.");
      break;
   }
 }
@@ -104,11 +117,10 @@ void procesarPulsacionLarga() {
      cambiarEstado (ARMADO);
      break;
     case ARMADO:
-    case ATERRIZADO:
      cambiarEstado (DESARMADO);
      break;
     default:
-     Serial.println("  -> Pulsacion larga ignorada en pleno vuelo/ignicion.");
+     Serial.println("  -> [IGNORADO] Pulsacion larga bloqueada en este estado.");
      break;
   }
 }
@@ -170,14 +182,23 @@ void loop() {
   }
 
   lastReading = reading;
-  //logica de la maquina de estadosss 
+  //logica de la maquina de estadosss con temporizadores no bloqueantes con milis
   switch (estadoActual) {
-    case APOGEO_IGNICION:
-      if (millis() - ignitionStartTime >= IGNITION_PULSE_MS) {
-        digitalWrite(PIN_LED_IGN, LOW);
-        cambiarEstado(ATERRIZADO);
+    case EN_VUELO:
+      if (millis() - ascentStartTime >= BACKUP_DEPLOY_MS) {
+        Serial.println("  -> [ALERTA] Temporizador de respaldo 8000 ms activado!");
+        cambiarEstado(APOGEO_IGNICION);
       }
       break;
+
+    case APOGEO_IGNICION:
+      if (!ignitionDone && (millis() - ignitionStartTime >= IGNITION_PULSE_MS)) {
+        digitalWrite(PIN_LED_IGN, LOW); //CORTA SU CORRIENTE
+        ignitionDone = true;
+        Serial.println("  -> Pulso de ignicion finalizado (1000 ms). Espereando pulsacion de aterrizaje...");
+      }
+      break;
+
     case ATERRIZADO:
       if(millis() - lastBlinkTime >= BEACON_BLINK_MS) {
         lastBlinkTime = millis();
@@ -191,6 +212,7 @@ void loop() {
 
   }
 }
+
 
 
 // Simulacion de hardware en Wokwi: https://wokwi.com/projects/481081023571677185
