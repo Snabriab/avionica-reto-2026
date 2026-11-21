@@ -27,6 +27,8 @@ const unsigned long BEACON_BLINK_MS = 500; //ATERRIZADO
 //8 SEGUNDOS DESPUES DEL DESPEGUE PEROOO SOLO SIN DETECCION DEL CLIC APOGEO
 const unsigned long BACKUP_DEPLOY_MS = 8000;
 
+const TickType_t ESPERA_SIN_FIN = 0xFFFFFFFFUL; // Equivale al valor maximo de TickType_t en FreeRTOS (32 bits)
+
 //estados deee la mision
 enum EstadoMision {
   DESARMADO,
@@ -35,83 +37,128 @@ enum EstadoMision {
   APOGEO_IGNICION,
   ATERRIZADO
 };
-enum EventoBoton {
-  EVENTO_PULSACION_CORTA,
-  EVENTO_PULSACION_LARGA
+
+// tipos de eventos que viajan hacia la maquina de estados tareaControlLeds
+enum TipoEvento {
+  EV_PULSACION_CORTA,
+  EV_PULSACION_LARGA,
+  EV_ZONA_MUERTA,
+  EV_TICK_PARPADEO,
+  EV_RESPALDO_8S,
+  EV_FIN_IGNICION
 };
+//ESTRUCTURA PARA ENVIAR REGISTROS AL MONITOR EN SERIES SIN COLISIONES
 struct MensajeLog {
   unsigned long timestamp;
-  char texto [100];
+  char texto[100];
 };
-//colas de freeRTOS (queues)
+
+//tres colas FIFO independientes para comunnicar cada etapa
+QueueHandle_t colaCrudaISR; 
 QueueHandle_t colaEventos;
 QueueHandle_t colaLogs;
 
+//Timers por interrupcion interna de FreeRTOS 
+TimerHandle_t timerParpadeo;
+TimerHandle_t timerRespaldo;
+TimerHandle_t timerIgnicion;
+
+//Variables de estado de la mision
+EstadoMision estadoActual = DESARMADO;
+bool ledBlinkState = LOW;
+bool ignitionDone = false;
+
+//variable compartida con la interrupcion por hardware
+volatile unsigned long lastIsrTime = 0;
+
+//esto me enpaqueta un mensaje con marca de tiempo 
 void enviarLog(const char* msg) {
   if (colaLogs != NULL) {
     MensajeLog paquete;
     paquete.timestamp = millis();
     snprintf(paquete.texto, sizeof(paquete.texto), "%s", msg);
-    xQueueSend(colaLogs, &paquete, 0); // 0 ticks no delay
+    xQueueSend(colaLogs, &paquete, 0);
   }
 }
 
-EstadoMision estadoActual = DESARMADO;
+// Rutina de interrupcion por hardware en gpio4
+void IRAM_ATTR isrBoton() {
+  unsigned long ahora = millis();
+  //filtro antirrebote 50 ms directamente en la interrupcion
+  if (ahora - lastIsrTime >= DEBOUNCE_MS) {
+    lastIsrTime = ahora;
+    int estadoPin = digitalRead(PIN_BTN);
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xQueueSendFromISR(colaCrudaISR, &estadoPin, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken) {
+      portYIELD_FROM_ISR();
+    }
+  }
+}
 
-//temporizadores para el estado
-unsigned long ignitionStartTime = 0;
-unsigned long lastBlinkTime = 0;
-// CONTROL PARA UNA UNICA IGNICION
-unsigned long ascentStartTime = 0;
-bool ignitionDone = false;
+//callbacks de los Timers de FreeRTOS (envian eventos a colaEventos sin bloquear)
+void cbTimerParpadeo(TimerHandle_t xTimer) {
+  TipoEvento ev= EV_TICK_PARPADEO;
+  xQueueSend(colaEventos, &ev, 0);
+}
 
-bool ledBlinkState = LOW;
-
-int lastReading = HIGH;
-int stableState = HIGH;
-unsigned long lastDebounceTime = 0;
-unsigned long pressStartTime = 0;
-bool isPressed = false;
-
-void cambiarEstado(EstadoMision nuevoEstado) {
+void cbTimerRespaldo(TimerHandle_t xTimer) {
+  TipoEvento ev = EV_RESPALDO_8S;
+  xQueueSend(colaEventos, &ev, 0);
+}
+void cbTimerIgnicion(TimerHandle_t xTimer) {
+  TipoEvento ev = EV_FIN_IGNICION;
+  xQueueSend(colaEventos, &ev, 0);
+}
+void cambiarEstado(EstadoMision nuevoEstado){
   estadoActual = nuevoEstado;
 
-  //esto va a apagar todos los leds antes de configurar el nuevo estado:)
+  //detener temporizadores activos del estado anteriror antes de configurar el nuevo
+  xTimerStop(timerParpadeo, 0);
+  xTimerStop(timerRespaldo, 0);
+  xTimerStop(timerIgnicion, 0);
+
+  //apagar todos lo lesds antes de configurar el nuevo estado
   digitalWrite(PIN_LED_1, LOW);
   digitalWrite(PIN_LED_2, LOW);
   digitalWrite(PIN_LED_3, LOW);
   digitalWrite(PIN_LED_IGN, LOW);
   ledBlinkState = HIGH;
 
-//este me va indicar las fases y manda a prender leds
   switch (estadoActual) {
     case DESARMADO:
-    digitalWrite(PIN_LED_1, HIGH);
-    enviarLog("Transicion -> DESARMADO (Verde parpadeo lento 1000 ms)");
-    break;
+     digitalWrite(PIN_LED_1, HIGH);
+     xTimerChangePeriod(timerParpadeo, pdMS_TO_TICKS(SLOW_BLINK_MS), 0);
+     xTimerStart(timerParpadeo, 0);
+     enviarLog("Transicion -> DESARMADO (Verde parpadeo lento 1000 ms)");
+     break;
     case ARMADO:
-    digitalWrite(PIN_LED_1, HIGH);
-    enviarLog("Transicion -> ARMADO (Verde fijo - Listo para lanzamiento)");
-    break;
-    //contador de 8 segundos 
+      digitalWrite(PIN_LED_1, HIGH);
+      enviarLog("Transicion -> ARMADO (Verde fijo - Listo para lanzamiento)");
+      break;
+
     case EN_VUELO:
-    digitalWrite(PIN_LED_2, HIGH);
-    ascentStartTime = millis();
-    enviarLog("Transicion -> EN_VUELO (Ascenso activo. Amarillo parpadeo rapido 200 ms - Respaldo 8s iniciado)");
-    break;
+      digitalWrite(PIN_LED_2, HIGH);
+      xTimerChangePeriod(timerParpadeo, pdMS_TO_TICKS(FAST_BLINK_MS), 0);
+      xTimerStart(timerParpadeo, 0);
+      xTimerStart(timerRespaldo, 0); // Inicia cuenta regresiva unica de 8000 ms
+      enviarLog("Transicion -> EN_VUELO (Amarillo parpadeo rapido 200 ms - Respaldo 8s iniciado)");
+      break;
+
     case APOGEO_IGNICION:
-    digitalWrite(PIN_LED_3, HIGH);
-    digitalWrite(PIN_LED_IGN, HIGH);
-    ignitionStartTime = millis();
-    ignitionDone = false;
-    enviarLog("Transicion -> APOGEO_IGNICION (Disparo unico de paracaidas 1000ms - Esperando aterrizaje)");
-    break;
+      digitalWrite(PIN_LED_3, HIGH);
+      digitalWrite(PIN_LED_IGN, HIGH);
+      ignitionDone = false;
+      xTimerStart(timerIgnicion, 0); // Inicia pulso pirotecnico unico de 1000 ms
+      enviarLog("Transicion -> APOGEO_IGNICION (Disparo unico de paracaidas 1000 ms - Esperando aterrizaje)");
+      break;
+
     case ATERRIZADO:
-    ledBlinkState = HIGH;
-    digitalWrite(PIN_LED_3, ledBlinkState);
-    lastBlinkTime = millis();
-    enviarLog("TRANSICION -> ATERRIZADO (Baliza de recuperacion activa - LED Rojo parpadeando)");
-    break;
+      digitalWrite(PIN_LED_3, HIGH);
+      xTimerChangePeriod(timerParpadeo, pdMS_TO_TICKS(BEACON_BLINK_MS), 0);
+      xTimerStart(timerParpadeo, 0);
+      enviarLog("Transicion -> ATERRIZADO (Baliza de recuperacion activa - Rojo parpadeando 500 ms)");
+      break;
   }
 }
 
@@ -147,112 +194,100 @@ void procesarPulsacionLarga() {
   }
 }
 
+// TAREA 1 (Nucleo 0): Calcula duracion del pulso despertada por interrupcion
 void TareaBoton(void* pvParameters) {
+  int estadoPinRecibido;
+  unsigned long tiempoInicioPulsacion = 0;
+  bool botonPresionado = false;
+
   for (;;) {
-  int reading = digitalRead(PIN_BTN);
+    // Espera pasiva (0% CPU) hasta que la ISR en GPIO 4 envia un cambio de estado
+    if (xQueueReceive(colaCrudaISR, &estadoPinRecibido, ESPERA_SIN_FIN) == pdTRUE) {
+      if (estadoPinRecibido == LOW && !botonPresionado) {
+        tiempoInicioPulsacion = millis();
+        botonPresionado = true;
+      } else if (estadoPinRecibido == HIGH && botonPresionado) {
+        unsigned long duracion = millis() - tiempoInicioPulsacion;
+        botonPresionado = false;
 
-  if (reading != lastReading) {
-    lastDebounceTime = millis();
-   }
-  
-  if ((millis() - lastDebounceTime) > DEBOUNCE_MS) {
-    if (reading != stableState) {
-      stableState = reading;
-
-      if (stableState == LOW) {
-        pressStartTime = millis();
-        isPressed = true;
-      } else if (stableState == HIGH && isPressed) {
-        unsigned long pressDuration = millis() - pressStartTime;
-        isPressed = false;
-
-        if (pressDuration < SHORT_PRESS_MAX) {
-          EventoBoton ev = EVENTO_PULSACION_CORTA;
+        if (duracion < SHORT_PRESS_MAX) {
+          TipoEvento ev = EV_PULSACION_CORTA;
           xQueueSend(colaEventos, &ev, 0);
-        } else if (pressDuration >= LONG_PRESS_MIN) {
-          EventoBoton ev = EVENTO_PULSACION_LARGA;
+        } else if (duracion >= LONG_PRESS_MIN) {
+          TipoEvento ev = EV_PULSACION_LARGA;
           xQueueSend(colaEventos, &ev, 0);
         } else {
           enviarLog("[IGNORADO] Pulsacion en zona muerta (1000-2000 ms)");
         }
       }
     }
-   }
-
-   lastReading = reading;
-   taskYIELD(); //cede CPU al planificador FreeRTOS sin bloquear ni usar delay()
   }
 }
-// Maquina de estados, temp y control de leds 
+
+// TAREA 2 (Nucleo 1): Ejecuta la Maquina de Estados y LEDs guiada por eventos
 void TareaControlLEDs(void* pvParameters) {
-  EventoBoton eventoRecibido;
+  TipoEvento ev;
 
   for (;;) {
-    //1esto me revisa si hay un evento nuevo en la cola
-    if (xQueueReceive(colaEventos, &eventoRecibido, 0) == pdTRUE) {
-      if (eventoRecibido == EVENTO_PULSACION_CORTA) {
-        procesarPulsacionCorta();
-      } else if (eventoRecibido == EVENTO_PULSACION_LARGA) {
-        procesarPulsacionLarga();
+    // Espera pasiva (0% CPU) hasta recibir evento de boton o alarma de timer
+    if (xQueueReceive(colaEventos, &ev, ESPERA_SIN_FIN) == pdTRUE) {
+      switch (ev) {
+        case EV_PULSACION_CORTA:
+          procesarPulsacionCorta();
+          break;
+
+        case EV_PULSACION_LARGA:
+          procesarPulsacionLarga();
+          break;
+
+        case EV_TICK_PARPADEO:
+          ledBlinkState = !ledBlinkState;
+          if (estadoActual == DESARMADO) {
+            digitalWrite(PIN_LED_1, ledBlinkState);
+          } else if (estadoActual == EN_VUELO) {
+            digitalWrite(PIN_LED_2, ledBlinkState);
+          } else if (estadoActual == ATERRIZADO) {
+            digitalWrite(PIN_LED_3, ledBlinkState);
+          }
+          break;
+
+        case EV_RESPALDO_8S:
+          if (estadoActual == EN_VUELO) {
+            enviarLog("[ALERTA] Temporizador de respaldo (8000 ms) activado!");
+            cambiarEstado(APOGEO_IGNICION);
+          }
+          break;
+
+        case EV_FIN_IGNICION:
+          if (estadoActual == APOGEO_IGNICION && !ignitionDone) {
+            digitalWrite(PIN_LED_IGN, LOW);
+            ignitionDone = true;
+            enviarLog("Pulso de ignicion finalizado (1000 ms). Esperando aterrizaje...");
+          }
+          break;
+
+        default:
+          break;
       }
     }
-    //2esta es la logica continua de los parpadeos y temporizadores con milis
-    switch (estadoActual) {
-      case DESARMADO:
-      if (millis() - lastBlinkTime >= SLOW_BLINK_MS) {
-        lastBlinkTime = millis();
-        ledBlinkState = !ledBlinkState;
-        digitalWrite(PIN_LED_1, ledBlinkState);
-      }
-      break;
-      
-      case EN_VUELO:
-       if (millis() - lastBlinkTime >= FAST_BLINK_MS) {
-        lastBlinkTime = millis();
-        ledBlinkState = !ledBlinkState;
-        digitalWrite(PIN_LED_2, ledBlinkState);
-       }
-       if (millis() - ascentStartTime >= BACKUP_DEPLOY_MS) {
-        enviarLog("[ALERTA] Temporizador de respaldo (8000 ms) activado!");
-        cambiarEstado(APOGEO_IGNICION);
-       }
-       break;
-      case APOGEO_IGNICION:
-       if (!ignitionDone && (millis() - ignitionStartTime >= IGNITION_PULSE_MS)) {
-        digitalWrite(PIN_LED_IGN, LOW);
-        ignitionDone = true;
-        enviarLog("Pulso de ignicion finalizado (1000 ms). Esperando aterrizaje...");
-       }
-       break;
-      case ATERRIZADO:
-       if (millis() - lastBlinkTime >= BEACON_BLINK_MS) {
-        lastBlinkTime = millis();
-        ledBlinkState = !ledBlinkState;
-        digitalWrite(PIN_LED_3, ledBlinkState);
-       }
-       break;
-
-       default:
-       break;
-    }
-
-    taskYIELD();
   }
 }
-// escribe los registros seriales desde colalogs sin colisiones
+
+// TAREA 3 (Nucleo 0): Imprime telemetria serial sin colisiones
 void TareaRegistroSerial(void* pvParameters) {
   MensajeLog paquete;
 
   for (;;) {
-    if (xQueueReceive(colaLogs, &paquete, 0) == pdTRUE) {
+    // Espera pasiva (0% CPU) hasta que llega un mensaje a colaLogs
+    if (xQueueReceive(colaLogs, &paquete, ESPERA_SIN_FIN) == pdTRUE) {
       Serial.print("[");
       Serial.print(paquete.timestamp);
       Serial.print(" ms] ");
       Serial.println(paquete.texto);
     }
-    taskYIELD();
   }
 }
+
 void setup() {
   Serial.begin(115200);
 
@@ -261,22 +296,34 @@ void setup() {
   pinMode(PIN_LED_2, OUTPUT);
   pinMode(PIN_LED_3, OUTPUT);
   pinMode(PIN_LED_IGN, OUTPUT);
-  // CREA COLAS FIFO ANTES DE INICIAR LAS TAREAS 
-  colaEventos = xQueueCreate(10, sizeof(EventoBoton));
-  colaLogs = xQueueCreate(20, sizeof(MensajeLog));
 
-  enviarLog("=== SISTEMA DE RECUPERACION INICIADO (FreeRTOS Dual-Core) ===");
-  cambiarEstado (DESARMADO);
+  // 1. Crear colas FIFO antes de tareas, timers e interrupciones
+  colaCrudaISR = xQueueCreate(10, sizeof(int));
+  colaEventos  = xQueueCreate(15, sizeof(TipoEvento));
+  colaLogs     = xQueueCreate(20, sizeof(MensajeLog));
 
-  //esto me crea 3 tareas repartidas en los os nucleos de la esp32
-  xTaskCreatePinnedToCore(TareaBoton, "TareaBoton",  2048, NULL, 2, NULL, 0);
+  // 2. Crear timers por software del RTOS (pdTRUE = periodico, pdFALSE = un disparo)
+  timerParpadeo = xTimerCreate("TimerBlink",  pdMS_TO_TICKS(SLOW_BLINK_MS),     pdTRUE,  NULL, cbTimerParpadeo);
+  timerRespaldo = xTimerCreate("TimerBackup", pdMS_TO_TICKS(BACKUP_DEPLOY_MS),  pdFALSE, NULL, cbTimerRespaldo);
+  timerIgnicion = xTimerCreate("TimerIgn",    pdMS_TO_TICKS(IGNITION_PULSE_MS), pdFALSE, NULL, cbTimerIgnicion);
+
+  // 3. Registrar interrupcion por hardware en GPIO 4 ante cualquier flanco (CHANGE)
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN), isrBoton, CHANGE);
+
+  // 4. Iniciar en estado seguro DESARMADO y arrancar las 3 tareas en dual-core
+  enviarLog("=== SISTEMA DE RECUPERACION INICIADO (FreeRTOS + Interrupciones) ===");
+  cambiarEstado(DESARMADO);
+
+  xTaskCreatePinnedToCore(TareaBoton,          "TareaBoton",  2048, NULL, 3, NULL, 0);
   xTaskCreatePinnedToCore(TareaRegistroSerial, "TareaSerial", 2048, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(TareaControlLEDs, "TareaLEDs", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(TareaControlLEDs,    "TareaLEDs",   4096, NULL, 2, NULL, 1);
 }
+
 void loop() {
-  //FreeRTOS toma el control de las tareas, se elimina el loop() para liberar ram/cpu
+  // Se elimina la tarea loop() por defecto; todo el sistema opera por interrupciones
   vTaskDelete(NULL);
 }
+
 
 
 // Simulacion de hardware en Wokwi: https://wokwi.com/projects/481081023571677185
