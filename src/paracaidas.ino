@@ -7,6 +7,8 @@
 // - LED Azul (Ignicion): GPIO 22
 
 
+
+
 const int PIN_BTN     = 4;
 const int PIN_LED_1   = 18;
 const int PIN_LED_2   = 19;
@@ -33,6 +35,26 @@ enum EstadoMision {
   APOGEO_IGNICION,
   ATERRIZADO
 };
+enum EventoBoton {
+  EVENTO_PULSACION_CORTA,
+  EVENTO_PULSACION_LARGA
+};
+struct MensajeLog {
+  unsigned long timestamp;
+  char texto [100];
+};
+//colas de freeRTOS (queues)
+QueueHandle_t colaEventos;
+QueueHandle_t colaLogs;
+
+void enviarLog(const char* msg) {
+  if (colaLogs != NULL) {
+    MensajeLog paquete;
+    paquete.timestamp = millis();
+    snprintf(paquete.texto, sizeof(paquete.texto), "%s", msg);
+    xQueueSend(colaLogs, &paquete, 0); // 0 ticks no delay
+  }
+}
 
 EstadoMision estadoActual = DESARMADO;
 
@@ -61,37 +83,34 @@ void cambiarEstado(EstadoMision nuevoEstado) {
   digitalWrite(PIN_LED_IGN, LOW);
   ledBlinkState = HIGH;
 
-  Serial.print("[");
-  Serial.print(millis());
-  Serial.print("ms] TRANSICION ->");
-
 //este me va indicar las fases y manda a prender leds
   switch (estadoActual) {
     case DESARMADO:
-    Serial.println("DESARMADO (Verde parpadeo lento 1000 ms)");
+    digitalWrite(PIN_LED_1, HIGH);
+    enviarLog("Transicion -> DESARMADO (Verde parpadeo lento 1000 ms)");
     break;
     case ARMADO:
     digitalWrite(PIN_LED_1, HIGH);
-    Serial.println("ARMADO (Verde fijo - Listo para lanzamiento)");
+    enviarLog("Transicion -> ARMADO (Verde fijo - Listo para lanzamiento)");
     break;
     //contador de 8 segundos 
     case EN_VUELO:
     digitalWrite(PIN_LED_2, HIGH);
     ascentStartTime = millis();
-    Serial.println("EN_VUELO (Ascenso activo. Amarillo parpadeo rapido - Respaldo 8s iniciado)");
+    enviarLog("Transicion -> EN_VUELO (Ascenso activo. Amarillo parpadeo rapido 200 ms - Respaldo 8s iniciado)");
     break;
     case APOGEO_IGNICION:
     digitalWrite(PIN_LED_3, HIGH);
     digitalWrite(PIN_LED_IGN, HIGH);
     ignitionStartTime = millis();
     ignitionDone = false;
-    Serial.println("APOGEO_IGNICION (Disparo unico de paracaidas 1000ms - Esperando aterrizaje)");
+    enviarLog("Transicion -> APOGEO_IGNICION (Disparo unico de paracaidas 1000ms - Esperando aterrizaje)");
     break;
     case ATERRIZADO:
     ledBlinkState = HIGH;
     digitalWrite(PIN_LED_3, ledBlinkState);
     lastBlinkTime = millis();
-    Serial.println("ATERRIZADO (Baliza de recuperacion activa - LED Rojo parpadeando)");
+    enviarLog("TRANSICION -> ATERRIZADO (Baliza de recuperacion activa - LED Rojo parpadeando)");
     break;
   }
 }
@@ -109,7 +128,7 @@ void procesarPulsacionCorta() {
      cambiarEstado(ATERRIZADO);
      break;
     default:
-     Serial.println("  -> [IGNORADO] Pulsacion corta no valida en este estado.");
+     enviarLog("[IGNORADO] Pulsacion corta no valida en este estado.");
      break;
   }
 }
@@ -123,11 +142,117 @@ void procesarPulsacionLarga() {
      cambiarEstado (DESARMADO);
      break;
     default:
-     Serial.println("  -> [IGNORADO] Pulsacion larga bloqueada en este estado.");
+     enviarLog("[IGNORADO] Pulsacion larga bloqueada en este estado.");
      break;
   }
 }
 
+void TareaBoton(void* pvParameters) {
+  for (;;) {
+  int reading = digitalRead(PIN_BTN);
+
+  if (reading != lastReading) {
+    lastDebounceTime = millis();
+   }
+  
+  if ((millis() - lastDebounceTime) > DEBOUNCE_MS) {
+    if (reading != stableState) {
+      stableState = reading;
+
+      if (stableState == LOW) {
+        pressStartTime = millis();
+        isPressed = true;
+      } else if (stableState == HIGH && isPressed) {
+        unsigned long pressDuration = millis() - pressStartTime;
+        isPressed = false;
+
+        if (pressDuration < SHORT_PRESS_MAX) {
+          EventoBoton ev = EVENTO_PULSACION_CORTA;
+          xQueueSend(colaEventos, &ev, 0);
+        } else if (pressDuration >= LONG_PRESS_MIN) {
+          EventoBoton ev = EVENTO_PULSACION_LARGA;
+          xQueueSend(colaEventos, &ev, 0);
+        } else {
+          enviarLog("[IGNORADO] Pulsacion en zona muerta (1000-2000 ms)");
+        }
+      }
+    }
+   }
+
+   lastReading = reading;
+   taskYIELD(); //cede CPU al planificador FreeRTOS sin bloquear ni usar delay()
+  }
+}
+// Maquina de estados, temp y control de leds 
+void TareaControlLEDs(void* pvParameters) {
+  EventoBoton eventoRecibido;
+
+  for (;;) {
+    //1esto me revisa si hay un evento nuevo en la cola
+    if (xQueueReceive(colaEventos, &eventoRecibido, 0) == pdTRUE) {
+      if (eventoRecibido == EVENTO_PULSACION_CORTA) {
+        procesarPulsacionCorta();
+      } else if (eventoRecibido == EVENTO_PULSACION_LARGA) {
+        procesarPulsacionLarga();
+      }
+    }
+    //2esta es la logica continua de los parpadeos y temporizadores con milis
+    switch (estadoActual) {
+      case DESARMADO:
+      if (millis() - lastBlinkTime >= SLOW_BLINK_MS) {
+        lastBlinkTime = millis();
+        ledBlinkState = !ledBlinkState;
+        digitalWrite(PIN_LED_1, ledBlinkState);
+      }
+      break;
+      
+      case EN_VUELO:
+       if (millis() - lastBlinkTime >= FAST_BLINK_MS) {
+        lastBlinkTime = millis();
+        ledBlinkState = !ledBlinkState;
+        digitalWrite(PIN_LED_2, ledBlinkState);
+       }
+       if (millis() - ascentStartTime >= BACKUP_DEPLOY_MS) {
+        enviarLog("[ALERTA] Temporizador de respaldo (8000 ms) activado!");
+        cambiarEstado(APOGEO_IGNICION);
+       }
+       break;
+      case APOGEO_IGNICION:
+       if (!ignitionDone && (millis() - ignitionStartTime >= IGNITION_PULSE_MS)) {
+        digitalWrite(PIN_LED_IGN, LOW);
+        ignitionDone = true;
+        enviarLog("Pulso de ignicion finalizado (1000 ms). Esperando aterrizaje...");
+       }
+       break;
+      case ATERRIZADO:
+       if (millis() - lastBlinkTime >= BEACON_BLINK_MS) {
+        lastBlinkTime = millis();
+        ledBlinkState = !ledBlinkState;
+        digitalWrite(PIN_LED_3, ledBlinkState);
+       }
+       break;
+
+       default:
+       break;
+    }
+
+    taskYIELD();
+  }
+}
+// escribe los registros seriales desde colalogs sin colisiones
+void TareaRegistroSerial(void* pvParameters) {
+  MensajeLog paquete;
+
+  for (;;) {
+    if (xQueueReceive(colaLogs, &paquete, 0) == pdTRUE) {
+      Serial.print("[");
+      Serial.print(paquete.timestamp);
+      Serial.print(" ms] ");
+      Serial.println(paquete.texto);
+    }
+    taskYIELD();
+  }
+}
 void setup() {
   Serial.begin(115200);
 
@@ -136,102 +261,22 @@ void setup() {
   pinMode(PIN_LED_2, OUTPUT);
   pinMode(PIN_LED_3, OUTPUT);
   pinMode(PIN_LED_IGN, OUTPUT);
+  // CREA COLAS FIFO ANTES DE INICIAR LAS TAREAS 
+  colaEventos = xQueueCreate(10, sizeof(EventoBoton));
+  colaLogs = xQueueCreate(20, sizeof(MensajeLog));
 
-  // Asegurar todos los LEDs apagados al arrancar
-  digitalWrite(PIN_LED_1, LOW);
-  digitalWrite(PIN_LED_2, LOW);
-  digitalWrite(PIN_LED_3, LOW);
-  digitalWrite(PIN_LED_IGN, LOW);
+  enviarLog("=== SISTEMA DE RECUPERACION INICIADO (FreeRTOS Dual-Core) ===");
+  cambiarEstado (DESARMADO);
 
-  Serial.println("=== SISTEMA DE RECUPERACION INICIADO ===");
-  cambiarEstado(DESARMADO);
+  //esto me crea 3 tareas repartidas en los os nucleos de la esp32
+  xTaskCreatePinnedToCore(TareaBoton, "TareaBoton",  2048, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(TareaRegistroSerial, "TareaSerial", 2048, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(TareaControlLEDs, "TareaLEDs", 4096, NULL, 2, NULL, 1);
 }
-
 void loop() {
-  int reading = digitalRead(PIN_BTN);
-
-  if (reading != lastReading) {
-    lastDebounceTime = millis();
-  }
-
-  if ((millis() - lastDebounceTime) > DEBOUNCE_MS) {
-    if (reading != stableState) {
-      stableState = reading;
-
-      if (stableState == LOW) {
-        pressStartTime = millis();
-        isPressed = true;
-        
-      } else if (stableState == HIGH && isPressed) {
-        unsigned long duration = millis() - pressStartTime;
-        isPressed = false;
-        
-
-        Serial.print("[");
-        Serial.print(millis());
-        Serial.print(" ms] Pulsacion de ");
-        Serial.print(duration);
-        Serial.print(" ms -> ");
-
-        if (duration < SHORT_PRESS_MAX) {
-          procesarPulsacionCorta();
-        } else if (duration >= LONG_PRESS_MIN) {
-          procesarPulsacionLarga();
-        } else {
-          Serial.println("   -> Pulsacion ignorada (zona muerta 1s - 2s)");
-        }
-      }
-    }
-  }
-
-  lastReading = reading;
-  //logica de la maquina de estadosss con temporizadores no bloqueantes con milis
-  switch (estadoActual) {
-    case DESARMADO:
-      if (millis() - lastBlinkTime >= SLOW_BLINK_MS) {
-        lastBlinkTime = millis();
-        ledBlinkState = !ledBlinkState;
-        digitalWrite(PIN_LED_1, ledBlinkState);
-      }
-      break;
-
-    case EN_VUELO:
-    //este hsce el parpadeo rapido del led amarillo (En el ascenso)
-      if (millis() - lastBlinkTime >= FAST_BLINK_MS) {
-        lastBlinkTime = millis();
-        ledBlinkState = !ledBlinkState;
-        digitalWrite(PIN_LED_2, ledBlinkState);
-      }
-      //para el temporizador 8000ms 
-      if (millis() - ascentStartTime >= BACKUP_DEPLOY_MS) {
-        Serial.println("  -> [ALERTA] Temporizador de respaldo 8000 ms activado!");
-        cambiarEstado(APOGEO_IGNICION);
-      }
-      break;
-
-    case APOGEO_IGNICION:
-      if (!ignitionDone && (millis() - ignitionStartTime >= IGNITION_PULSE_MS)) {
-        digitalWrite(PIN_LED_IGN, LOW); //CORTA SU CORRIENTE
-        ignitionDone = true;
-        Serial.println("  -> Pulso de ignicion finalizado (1000 ms). Espereando pulsacion de aterrizaje...");
-      }
-      break;
-
-    case ATERRIZADO:
-      if(millis() - lastBlinkTime >= BEACON_BLINK_MS) {
-        lastBlinkTime = millis();
-        ledBlinkState = !ledBlinkState;
-        digitalWrite(PIN_LED_3, ledBlinkState);
-      }
-    break;
-
-    default:
-    break;
-
-  }
+  //FreeRTOS toma el control de las tareas, se elimina el loop() para liberar ram/cpu
+  vTaskDelete(NULL);
 }
-
-
 
 
 // Simulacion de hardware en Wokwi: https://wokwi.com/projects/481081023571677185
