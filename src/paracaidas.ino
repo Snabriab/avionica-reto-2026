@@ -19,7 +19,9 @@ const unsigned long SHORT_PRESS_MAX = 1000;
 const unsigned long LONG_PRESS_MIN  = 2000;
 //tiempos de cambio de estado de la misionn
 const unsigned long IGNITION_PULSE_MS = 1000;
-const unsigned long BEACON_BLINK_MS = 500;
+const unsigned long SLOW_BLINK_MS = 1000; //parpadeo lento desarmado
+const unsigned long FAST_BLINK_MS = 200;
+const unsigned long BEACON_BLINK_MS = 500; //ATERRIZADO
 //8 SEGUNDOS DESPUES DEL DESPEGUE PEROOO SOLO SIN DETECCION DEL CLIC APOGEO
 const unsigned long BACKUP_DEPLOY_MS = 8000;
 
@@ -41,7 +43,7 @@ unsigned long lastBlinkTime = 0;
 unsigned long ascentStartTime = 0;
 bool ignitionDone = false;
 
-bool redLedState = LOW;
+bool ledBlinkState = LOW;
 
 int lastReading = HIGH;
 int stableState = HIGH;
@@ -57,6 +59,7 @@ void cambiarEstado(EstadoMision nuevoEstado) {
   digitalWrite(PIN_LED_2, LOW);
   digitalWrite(PIN_LED_3, LOW);
   digitalWrite(PIN_LED_IGN, LOW);
+  ledBlinkState = HIGH;
 
   Serial.print("[");
   Serial.print(millis());
@@ -65,17 +68,17 @@ void cambiarEstado(EstadoMision nuevoEstado) {
 //este me va indicar las fases y manda a prender leds
   switch (estadoActual) {
     case DESARMADO:
-    Serial.println("DESARMADO (Seguro activo - LEDs apagados)");
+    Serial.println("DESARMADO (Verde parpadeo lento 1000 ms)");
     break;
     case ARMADO:
     digitalWrite(PIN_LED_1, HIGH);
-    Serial.println("ARMADO (Listo en rampa - LED Verde)");
+    Serial.println("ARMADO (Verde fijo - Listo para lanzamiento)");
     break;
     //contador de 8 segundos 
     case EN_VUELO:
     digitalWrite(PIN_LED_2, HIGH);
     ascentStartTime = millis();
-    Serial.println("EN_VUELO (Ascenso activo - Temporizador respaldo 8s iniciado)");
+    Serial.println("EN_VUELO (Ascenso activo. Amarillo parpadeo rapido - Respaldo 8s iniciado)");
     break;
     case APOGEO_IGNICION:
     digitalWrite(PIN_LED_3, HIGH);
@@ -85,8 +88,8 @@ void cambiarEstado(EstadoMision nuevoEstado) {
     Serial.println("APOGEO_IGNICION (Disparo unico de paracaidas 1000ms - Esperando aterrizaje)");
     break;
     case ATERRIZADO:
-    redLedState = HIGH;
-    digitalWrite(PIN_LED_3, redLedState);
+    ledBlinkState = HIGH;
+    digitalWrite(PIN_LED_3, ledBlinkState);
     lastBlinkTime = millis();
     Serial.println("ATERRIZADO (Baliza de recuperacion activa - LED Rojo parpadeando)");
     break;
@@ -184,7 +187,22 @@ void loop() {
   lastReading = reading;
   //logica de la maquina de estadosss con temporizadores no bloqueantes con milis
   switch (estadoActual) {
+    case DESARMADO:
+      if (millis() - lastBlinkTime >= SLOW_BLINK_MS) {
+        lastBlinkTime = millis();
+        ledBlinkState = !ledBlinkState;
+        digitalWrite(PIN_LED_1, ledBlinkState);
+      }
+      break;
+
     case EN_VUELO:
+    //este hsce el parpadeo rapido del led amarillo (En el ascenso)
+      if (millis() - lastBlinkTime >= FAST_BLINK_MS) {
+        lastBlinkTime = millis();
+        ledBlinkState = !ledBlinkState;
+        digitalWrite(PIN_LED_2, ledBlinkState);
+      }
+      //para el temporizador 8000ms 
       if (millis() - ascentStartTime >= BACKUP_DEPLOY_MS) {
         Serial.println("  -> [ALERTA] Temporizador de respaldo 8000 ms activado!");
         cambiarEstado(APOGEO_IGNICION);
@@ -202,8 +220,8 @@ void loop() {
     case ATERRIZADO:
       if(millis() - lastBlinkTime >= BEACON_BLINK_MS) {
         lastBlinkTime = millis();
-        redLedState = !redLedState;
-        digitalWrite(PIN_LED_3, redLedState);
+        ledBlinkState = !ledBlinkState;
+        digitalWrite(PIN_LED_3, ledBlinkState);
       }
     break;
 
@@ -212,6 +230,7 @@ void loop() {
 
   }
 }
+
 
 
 
